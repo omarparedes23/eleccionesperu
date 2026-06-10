@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from "react"
 import dynamic from "next/dynamic"
 import type { ApiResult } from "./types"
+import { loadHistoricalTimeline, type HistoryPoint } from "./lib/load-snapshots"
 
 const DeptChart = dynamic(() => import("./components/DeptChart"), {
   ssr: false,
@@ -22,91 +23,38 @@ const TimelineChart = dynamic(() => import("./components/TimelineChart"), {
   ),
 })
 
+const WorldMapChart = dynamic(() => import("./components/WorldMapChart"), {
+  ssr: false,
+  loading: () => (
+    <div className="bg-white rounded-2xl border border-gray-100 p-4 flex items-center justify-center h-48">
+      <p className="text-gray-400 text-sm">Cargando mapa...</p>
+    </div>
+  ),
+})
+
+const ExteriorCountryTable = dynamic(() => import("./components/ExteriorCountryTable"), {
+  ssr: false,
+})
+
+const ProjectionPipeline = dynamic(() => import("./components/ProjectionPipeline"), {
+  ssr: false,
+})
+
+const ScenarioComparison = dynamic(() => import("./components/ScenarioComparison"), {
+  ssr: false,
+})
+
+const DeptProjectionTable = dynamic(() => import("./components/DeptProjectionTable"), {
+  ssr: false,
+})
+
 // --- Helpers ---
 const fmt = (n: number) => Math.round(n).toLocaleString("es-PE")
 const fmtSigned = (n: number) => (n >= 0 ? "+" : "") + fmt(n)
 const ts = (iso: string) =>
   new Date(iso).toLocaleTimeString("es-PE", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
 
-type HistoryPoint = {
-  hora: string
-  central: number
-  min: number
-  max: number
-  pctActas: number
-}
 
-// --- Card de proyección final ---
-function ProyeccionCard({ p }: { p: ApiResult["proyeccion"] }) {
-  const ganador = p.central >= 0 ? "FP" : "JPP"
-  const color   = ganador === "FP" ? "text-orange-600" : "text-red-600"
-  const bg      = ganador === "FP" ? "bg-orange-50 border-orange-200" : "bg-red-50 border-red-200"
-
-  const items = [
-    { label: "Margen actual",   val: p.margenActual,   sub: "votos contabilizados" },
-    { label: "Pendiente (est.)", val: p.pendienteNeto, sub: `IC 95%: ±${fmt(p.ic)}` },
-    { label: "Exterior",        val: p.exteriorNeto,   sub: p.exteriorEsReal ? "datos reales" : "estimado" },
-  ]
-
-  return (
-    <div className={`rounded-2xl border p-5 space-y-4 ${bg}`}>
-      <h2 className="text-sm font-semibold uppercase tracking-wider text-gray-500">Proyección Final</h2>
-
-      <div className="space-y-2">
-        {items.map(({ label, val, sub }) => (
-          <div key={label} className="flex justify-between items-center text-sm">
-            <span className="text-gray-600">{label}</span>
-            <div className="text-right">
-              <span className={`font-mono font-semibold ${val >= 0 ? "text-orange-600" : "text-red-600"}`}>
-                {fmtSigned(val)}
-              </span>
-              <span className="text-xs text-gray-400 ml-2">{sub}</span>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      <div className="border-t border-gray-200 pt-3 space-y-1">
-        <div className="flex justify-between text-xs text-gray-500">
-          <span className="text-red-500">Mín: {fmtSigned(p.min)}</span>
-          <span className="text-gray-400">IC 95%</span>
-          <span className="text-orange-500">Máx: {fmtSigned(p.max)}</span>
-        </div>
-        {/* Barra de rango */}
-        <RangeBar min={p.min} max={p.max} central={p.central} />
-        <p className={`text-center text-lg font-bold ${color}`}>
-          {ganador} {fmtSigned(p.central)} votos
-        </p>
-        <p className="text-center text-xs text-gray-400">
-          Rango: [{fmtSigned(p.min)} / {fmtSigned(p.max)}]
-        </p>
-      </div>
-    </div>
-  )
-}
-
-function RangeBar({ min, max, central }: { min: number; max: number; central: number }) {
-  const span  = max - min || 1
-  const pct   = (v: number) => Math.max(0, Math.min(100, ((v - min) / span) * 100))
-  const zero  = pct(0)
-  const cPct  = pct(central)
-
-  return (
-    <div className="relative h-4 bg-gray-100 rounded-full overflow-hidden mt-1">
-      {/* Zona de rango */}
-      <div className="absolute inset-y-0 bg-blue-100 rounded-full" style={{ left: "0%", right: "0%" }} />
-      {/* Punto central */}
-      <div
-        className="absolute inset-y-0 w-1 bg-blue-500 rounded-full"
-        style={{ left: `calc(${cPct}% - 2px)` }}
-      />
-      {/* Línea de cero */}
-      {zero > 0 && zero < 100 && (
-        <div className="absolute inset-y-0 w-px bg-gray-400" style={{ left: `${zero}%` }} />
-      )}
-    </div>
-  )
-}
 
 // --- Card exterior ---
 function ExteriorCard({ ext }: { ext: ApiResult["exterior"] }) {
@@ -163,9 +111,6 @@ function ExteriorCard({ ext }: { ext: ApiResult["exterior"] }) {
           </div>
           <p className="text-center text-sm font-semibold text-orange-600">
             Neto est.: {fmtSigned(ext.netoEstimado)}
-          </p>
-          <p className="text-center text-xs text-gray-400">
-            Rango: [{fmtSigned(ext.netoMin)} / {fmtSigned(ext.netoMax)}]
           </p>
         </>
       )}
@@ -269,17 +214,48 @@ export default function Page() {
   const [refreshing, setRefreshing] = useState(false)
   const [error,      setError]      = useState<string | null>(null)
   const [history,    setHistory]    = useState<HistoryPoint[]>([])
-  const [autoMin,    setAutoMin]    = useState(0)      // 0 = off
+  const [autoMin,    setAutoMin]    = useState(0)
   const autoRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const fetchData = useCallback(async (isRefresh = false) => {
+    const label = isRefresh ? "🔄 Actualizar" : "🚀 Carga inicial"
+    console.log(`[${label}] Iniciando fetch /api/resultados...`)
     if (isRefresh) setRefreshing(true)
     else setLoading(true)
     setError(null)
+    const t0 = performance.now()
     try {
       const res = await fetch("/api/resultados")
-      if (!res.ok) throw new Error()
+      console.log(`[${label}] Response HTTP ${res.status} en ${Math.round(performance.now() - t0)}ms`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const d: ApiResult = await res.json()
+      console.log(`[${label}] Datos recibidos:`, {
+        timestamp: d.timestamp,
+        depts: d.departamentos.length,
+        nacional: `${d.nacional.fpPct.toFixed(2)}% FP / ${d.nacional.jppPct.toFixed(2)}% JPP`,
+        actas: `${d.nacional.actasPct.toFixed(1)}% (${d.nacional.contabilizadas.toLocaleString()}/${d.nacional.totalActas.toLocaleString()})`,
+        ventaja: `${d.nacional.ventaja >= 0 ? "FP" : "JPP"} ${Math.abs(d.nacional.ventaja).toLocaleString()}`,
+        proyeccion: `central=${Math.round(d.proyeccion.central)} min=${Math.round(d.proyeccion.min)} max=${Math.round(d.proyeccion.max)}`,
+        exteriorPaises: d.exteriorPaises?.length ?? 0,
+        paisesConDatos: d.proyeccion.paisesConDatos,
+        escenarioPesimista: d.escenarioPesimista ? `central=${Math.round(d.escenarioPesimista.central)}` : "null",
+      })
+      // Debug: mostrar info de países en consola
+      const dbg = (d as Record<string, unknown>)._debug as Record<string, unknown> | undefined
+      if (dbg) {
+        console.groupCollapsed(`[🔍 DEBUG] Países: ${dbg.paisesReales}/${dbg.paisesConDatos} reales, ${dbg.paisesRechazados} rechazados, ${dbg.paisesSinDatos} sin-datos, ${dbg.tiempoMs}ms`)
+        console.log(`Depts: ${dbg.deptsOk}/25 | Exterior agg: ${dbg.extOk} | VPA global: ${dbg.vpaGlobal}`)
+        const detalle = dbg.detalle as Array<{ nombre: string; estado: string; contabilizadas?: number; error?: string }> | undefined
+        if (detalle) {
+          const ok = detalle.filter(d => d.estado === "OK")
+          const sinDatos = detalle.filter(d => d.estado === "sin-datos")
+          const rechazados = detalle.filter(d => d.estado === "rechazado")
+          if (ok.length > 0) console.log("✅ Con datos:", ok.map(p => `${p.nombre}(${p.contabilizadas})`).join(", "))
+          if (sinDatos.length > 0) console.log("⚠️ Sin datos:", sinDatos.map(p => p.nombre).join(", "))
+          if (rechazados.length > 0) console.log("❌ Rechazados:", rechazados.map(p => `${p.nombre}: ${p.error}`).join("; "))
+        }
+        console.groupEnd()
+      }
       setData(d)
       setHistory(prev => [
         ...prev.slice(-29),
@@ -291,12 +267,23 @@ export default function Page() {
           pctActas: d.nacional.actasPct,
         },
       ])
-    } catch {
+    } catch (err) {
+      console.error(`[${label}] Error:`, err)
       setError("Error al cargar datos. Verifica tu conexión.")
     } finally {
       setLoading(false)
       setRefreshing(false)
+      console.log(`[${label}] Completado en ${Math.round(performance.now() - t0)}ms total`)
     }
+  }, [])
+
+  // Load historical snapshots on first render
+  useEffect(() => {
+    console.log("📚 Cargando histórico de snapshots...")
+    loadHistoricalTimeline().then(h => {
+      console.log(`📚 Histórico cargado: ${h.length} puntos, rango ${h[0]?.hora ?? "?"} → ${h[h.length - 1]?.hora ?? "?"}`)
+      if (h.length > 0) setHistory(h)
+    })
   }, [])
 
   useEffect(() => { fetchData() }, [fetchData])
@@ -313,7 +300,7 @@ export default function Page() {
   if (loading) return (
     <div className="min-h-screen flex flex-col items-center justify-center gap-4">
       <div className="w-12 h-12 border-4 border-orange-500 border-t-transparent rounded-full animate-spin" />
-      <p className="text-gray-500 text-sm">Cargando datos de los 25 departamentos + exterior...</p>
+      <p className="text-gray-500 text-sm">Cargando datos de los 25 departamentos + 77 países del exterior...</p>
     </div>
   )
 
@@ -326,16 +313,16 @@ export default function Page() {
     </div>
   )
 
-  const { nacional, departamentos, exterior, proyeccion } = data
+  const { nacional, departamentos, exterior, exteriorPaises, proyeccion, escenarioPesimista } = data
   const lider       = nacional.fp >= nacional.jpp ? "FP" : "JPP"
   const liderColor  = lider === "FP" ? "text-orange-500" : "text-red-600"
 
   return (
-    <main className="max-w-6xl mx-auto px-4 py-6 space-y-5">
+    <main className="max-w-7xl mx-auto px-4 py-6 space-y-5">
 
       {/* Header */}
       <div className="text-center">
-        <h1 className="text-2xl font-bold text-gray-900">Elecciones Perú 2026 — Segunda Vuelta</h1>
+        <h1 className="text-3xl font-bold text-gray-900">Elecciones Perú 2026 — Segunda Vuelta</h1>
         <p className="text-gray-400 text-xs mt-1">Fuente: API pública ONPE · {ts(data.timestamp)}</p>
       </div>
 
@@ -404,13 +391,18 @@ export default function Page() {
         </div>
       </div>
 
-      {/* Proyección + Exterior */}
+      {/* Proyección Pipeline */}
+      <ProjectionPipeline p={proyeccion} />
+
+      {/* Exterior card + Info */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <ProyeccionCard p={proyeccion} />
-        <ExteriorCard   ext={exterior} />
+        <ExteriorCard ext={exterior} />
+        {escenarioPesimista && (
+          <ScenarioComparison base={proyeccion} pesimista={escenarioPesimista} />
+        )}
       </div>
 
-      {/* Gráficos — dynamic import con ssr:false, carga solo en el cliente */}
+      {/* Gráficos — dynamic import con ssr:false */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <DeptChart departamentos={departamentos} />
         <TimelineChart history={history} />
@@ -419,8 +411,17 @@ export default function Page() {
       {/* Tabla departamentos */}
       <DeptTable departamentos={departamentos} />
 
+      {/* Proyección regional por departamento */}
+      <DeptProjectionTable departamentos={departamentos} />
+
+      {/* Mapa mundial + Tabla exterior */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <WorldMapChart paises={exteriorPaises} />
+        <ExteriorCountryTable paises={exteriorPaises} />
+      </div>
+
       <p className="text-center text-xs text-gray-400 pb-4">
-        Datos obtenidos directamente de la API pública de ONPE · Proyección con IC 95% binomial
+        Datos obtenidos de la API pública de ONPE · Proyección territorial IC 95% binomial · Exterior: modelo por país (77 países, blend bayesiano) · Prior 1V: USA/ESP/ITA 67/63/62%
       </p>
     </main>
   )
